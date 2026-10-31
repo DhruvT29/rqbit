@@ -545,6 +545,9 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
+    /// Whether pieces may be uploaded through it, when the application's
+    /// connector said.
+    pub may_upload: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct InternalAddResult {
@@ -968,14 +971,18 @@ impl Session {
             .with_context(|| format!("torrent {id} is not live, ignoring connection"))?;
 
         // The application sees every incoming connection, and may wrap it.
-        let (reader, writer): (BoxAsyncReadVectored, BoxAsyncWrite) =
+        let (reader, writer, may_upload): (BoxAsyncReadVectored, BoxAsyncWrite, _) =
             match (self.connector.peer_connector(), self.listen_addr) {
                 (Some(connector), Some(local)) => {
                     let socket =
                         connector.accepted(h.info_hash, local, addr, Box::new(reader), writer);
-                    (Box::new(socket.read.into_vectored_compat()), socket.write)
+                    (
+                        Box::new(socket.read.into_vectored_compat()),
+                        socket.write,
+                        Some(socket.may_upload),
+                    )
                 }
-                _ => (reader, writer),
+                _ => (reader, writer, None),
             };
 
         Ok((
@@ -987,6 +994,7 @@ impl Session {
                 kind,
                 handshake: h,
                 read_buf,
+                may_upload,
             },
         ))
     }

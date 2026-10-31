@@ -274,7 +274,12 @@ impl StreamConnector {
         &self,
         addr: SocketAddr,
         info_hash: Id20,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+    ) -> Result<(
+        ConnectionKind,
+        BoxAsyncReadVectored,
+        BoxAsyncWrite,
+        Option<Arc<AtomicBool>>,
+    )> {
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
                 "invalid peer address (port 0): {}",
@@ -303,6 +308,7 @@ impl StreamConnector {
                 ConnectionKind::Tcp,
                 Box::new(socket.read.into_vectored_compat()),
                 socket.write,
+                Some(socket.may_upload),
             ));
         }
 
@@ -315,6 +321,7 @@ impl StreamConnector {
                 ConnectionKind::Socks,
                 Box::new(r.into_vectored_compat()),
                 Box::new(w),
+                None,
             ));
         }
 
@@ -375,7 +382,7 @@ impl StreamConnector {
                     match tcp_res {
                         Ok(Some(stream)) => {
                             let (r, w) = stream.into_split();
-                            return Ok((ConnectionKind::Tcp, Box::new(r), Box::new(w)));
+                            return Ok((ConnectionKind::Tcp, Box::new(r), Box::new(w), None));
                         },
                         Ok(None) => {
                             tcp_err = Some(None);
@@ -391,7 +398,7 @@ impl StreamConnector {
                     match utp_res {
                         Ok(Some(stream)) => {
                             let (r, w) = stream.split();
-                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w)));
+                            return Ok((ConnectionKind::Utp, Box::new(r), Box::new(w), None));
                         },
                         Ok(None) => {
                             utp_err = Some(None);

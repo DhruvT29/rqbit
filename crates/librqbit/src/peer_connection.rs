@@ -124,6 +124,18 @@ struct ManagePeerArgs {
     write: BoxAsyncWrite,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
     have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
+    /// The application's upload switch for this connection, if it gave one.
+    may_upload: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// How often a connection with an upload switch looks at it.
+const UPLOAD_SWITCH_CHECK: Duration = Duration::from_secs(1);
+
+/// Whether a connection may upload: always without a switch.
+fn upload_allowed(may_upload: &Option<Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    may_upload
+        .as_ref()
+        .is_none_or(|m| m.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -203,6 +215,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             write: incoming.writer,
             outgoing_chan,
             have_broadcast,
+            may_upload: incoming.may_upload,
         })
         .await
     }
@@ -224,7 +237,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let now = Instant::now();
-        let (ckind, mut read, mut write) = with_timeout(
+        let (ckind, mut read, mut write, may_upload) = with_timeout(
             "connecting",
             connect_timeout,
             self.connector.connect(self.addr, self.info_hash),
@@ -272,6 +285,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 write,
                 outgoing_chan,
                 have_broadcast,
+                may_upload,
             })
             .await
         }
@@ -288,7 +302,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             mut write,
             mut outgoing_chan,
             mut have_broadcast,
+            may_upload,
         } = args;
+
+        // A peer starts choked. Without a switch it is unchoked at once, as
+        // before; with one, only while the switch allows uploading, and a
+        // change is sent as Choke or Unchoke within UPLOAD_SWITCH_CHECK.
+        let mut unchoked = upload_allowed(&may_upload);
+        let mut switch_check = tokio::time::interval(UPLOAD_SWITCH_CHECK);
+        switch_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         use tokio::io::AsyncWriteExt;
 
@@ -339,14 +361,16 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
+            if unchoked {
+                let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write.write_all(&write_buf[..len]).map_err(Error::Write),
+                )
+                .await?;
+                trace!("sent unchoke");
+            }
 
             let mut broadcast_closed = false;
 
@@ -368,6 +392,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             },
                             _ => continue
                         },
+                        _ = switch_check.tick(), if may_upload.is_some() => {
+                            let now = upload_allowed(&may_upload);
+                            if now == unchoked {
+                                continue
+                            }
+                            unchoked = now;
+                            WriterRequest::Message(if now { Message::Unchoke } else { Message::Choke })
+                        },
                         r = timeout(keep_alive_interval, outgoing_chan.recv()) => match r {
                             Ok(Some(msg)) => msg,
                             Ok(None) => {
@@ -379,6 +411,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 };
 
                 tokio::task::yield_now().await;
+
+                // A choked peer gets no piece data, even if it asks.
+                if matches!(req, WriterRequest::ReadChunkRequest(_)) && !unchoked {
+                    trace!("peer is choked, not uploading the chunk it asked for");
+                    continue;
+                }
 
                 let mut uploaded_add = None;
 
