@@ -95,7 +95,7 @@ pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
-pub use stream_connect::ConnectionOptions;
+pub use stream_connect::{ConnectionOptions, PeerConnector, PeerSocket};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState,

@@ -1,9 +1,16 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
+use futures::future::BoxFuture;
+use librqbit_core::hash_id::Id20;
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::{BindDevice, UtpSocketUdp};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
 use crate::{
@@ -32,6 +39,49 @@ impl std::fmt::Display for ConnectionKind {
     }
 }
 
+/// A peer connection the application opened, or let in (see [`PeerConnector`]).
+pub struct PeerSocket {
+    pub read: Box<dyn AsyncRead + Send + Unpin>,
+    pub write: Box<dyn AsyncWrite + Send + Unpin>,
+    /// Whether pieces may be uploaded to this peer. The application may
+    /// change it at any time.
+    pub may_upload: Arc<AtomicBool>,
+}
+
+/// Lets the application open every outgoing peer connection itself, and see
+/// every incoming one, for example to choose the local address (and so the
+/// network interface) each connection uses, and to count its bytes. When
+/// set, outgoing connections use neither uTP nor the SOCKS proxy.
+pub trait PeerConnector: Send + Sync + 'static {
+    /// Open a connection to `peer` for the torrent `info_hash`.
+    fn connect(
+        &self,
+        info_hash: Id20,
+        peer: SocketAddr,
+    ) -> BoxFuture<'static, std::io::Result<PeerSocket>>;
+
+    /// A connection from `peer` to the listener on `local`, whose handshake
+    /// named `info_hash`. Returns the streams to use from here on.
+    fn accepted(
+        &self,
+        info_hash: Id20,
+        local: SocketAddr,
+        peer: SocketAddr,
+        read: Box<dyn AsyncRead + Send + Unpin>,
+        write: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> PeerSocket;
+}
+
+/// A [`PeerConnector`], held where `Debug` is derived.
+#[derive(Clone)]
+pub(crate) struct PeerConnectorRef(pub Arc<dyn PeerConnector>);
+
+impl std::fmt::Debug for PeerConnectorRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerConnector")
+    }
+}
+
 pub struct ConnectionOptions {
     // socks5://[username:password@]host:port
     // If set, all outgoing connections will go through the proxy over TCP.
@@ -39,6 +89,8 @@ pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
+    /// If set, opens every outgoing peer connection and sees every incoming one.
+    pub peer_connector: Option<Arc<dyn PeerConnector>>,
 }
 
 impl Default for ConnectionOptions {
@@ -47,6 +99,7 @@ impl Default for ConnectionOptions {
             enable_tcp: true,
             proxy_url: None,
             peer_opts: None,
+            peer_connector: None,
         }
     }
 }
@@ -65,6 +118,7 @@ pub(crate) struct StreamConnectorArgs {
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
+    pub peer_connector: Option<PeerConnectorRef>,
 }
 
 impl SocksProxyConfig {
@@ -135,6 +189,7 @@ pub(crate) struct StreamConnector {
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
+    peer_connector: Option<PeerConnectorRef>,
 }
 
 impl StreamConnector {
@@ -160,7 +215,13 @@ impl StreamConnector {
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
+            peer_connector: config.peer_connector,
         })
+    }
+
+    /// The application's connector, if it gave one.
+    pub(crate) fn peer_connector(&self) -> Option<&Arc<dyn PeerConnector>> {
+        self.peer_connector.as_ref().map(|c| &c.0)
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
@@ -212,6 +273,7 @@ impl StreamConnector {
     pub async fn connect(
         &self,
         addr: SocketAddr,
+        info_hash: Id20,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -225,6 +287,23 @@ impl StreamConnector {
                 "ipv6 disabled, skipping connection to {}",
                 addr
             )));
+        }
+
+        if let Some(connector) = self.peer_connector() {
+            let socket = self
+                .with_stat(
+                    ConnectionKind::Tcp,
+                    addr.is_ipv6(),
+                    connector.connect(info_hash, addr),
+                )
+                .await
+                .map_err(|e| Error::Anyhow(anyhow::Error::new(e)))?;
+            debug!(?addr, "connected through the application's connector");
+            return Ok((
+                ConnectionKind::Tcp,
+                Box::new(socket.read.into_vectored_compat()),
+                socket.write,
+            ));
         }
 
         if let Some(proxy) = self.proxy_config.as_ref() {

@@ -227,7 +227,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let (ckind, mut read, mut write) = with_timeout(
             "connecting",
             connect_timeout,
-            self.connector.connect(self.addr),
+            self.connector.connect(self.addr, self.info_hash),
         )
         .await?;
 

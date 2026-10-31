@@ -39,6 +39,7 @@ use crate::{
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
+    vectored_traits::AsyncReadVectoredIntoCompat,
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -738,6 +739,11 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
+                    peer_connector: opts
+                        .connect
+                        .as_ref()
+                        .and_then(|c| c.peer_connector.clone())
+                        .map(crate::stream_connect::PeerConnectorRef),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -960,6 +966,17 @@ impl Session {
             .live_wait_initializing(Duration::from_secs(5))
             .await
             .with_context(|| format!("torrent {id} is not live, ignoring connection"))?;
+
+        // The application sees every incoming connection, and may wrap it.
+        let (reader, writer): (BoxAsyncReadVectored, BoxAsyncWrite) =
+            match (self.connector.peer_connector(), self.listen_addr) {
+                (Some(connector), Some(local)) => {
+                    let socket =
+                        connector.accepted(h.info_hash, local, addr, Box::new(reader), writer);
+                    (Box::new(socket.read.into_vectored_compat()), socket.write)
+                }
+                _ => (reader, writer),
+            };
 
         Ok((
             live,
