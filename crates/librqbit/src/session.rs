@@ -116,6 +116,7 @@ pub struct Session {
     peer_id: Id20,
     announce_port: Option<u16>,
     listen_addr: Option<SocketAddr>,
+    utp_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
@@ -484,6 +485,11 @@ pub struct SessionOptions {
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
+    /// The one local address for the DHT, UDP tracker and uTP sockets and
+    /// the listener (and so the network interface they use), where binding
+    /// to a device is not available (Windows). Not with DHT persistence.
+    pub udp_bind_ip: Option<std::net::IpAddr>,
+
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
@@ -514,6 +520,7 @@ impl Default for SessionOptions {
             disable_upload: false,
             disable_local_service_discovery: false,
             ipv4_only: false,
+            udp_bind_ip: None,
             client_name_and_version: None,
         }
     }
@@ -599,6 +606,9 @@ impl Session {
                 None => None,
             };
 
+            if let (Some(ip), Some(listen)) = (opts.udp_bind_ip, opts.listen.as_mut()) {
+                listen.listen_addr.set_ip(ip);
+            }
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
@@ -616,6 +626,9 @@ impl Session {
 
             let dht = if let Some(dht_config) = opts.dht.take() {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
+                    if opts.udp_bind_ip.is_some() {
+                        bail!("udp_bind_ip does not work with DHT persistence");
+                    }
                     PersistentDht::create(
                         persistence_config,
                         dht_config.port,
@@ -627,7 +640,10 @@ impl Session {
                     .await
                     .context("error initializing persistent DHT")?
                 } else {
-                    let listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
+                    let listen_addr = match opts.udp_bind_ip {
+                        Some(ip) => SocketAddr::new(ip, dht_config.port.unwrap_or(0)),
+                        None => dht_listen_addr(dht_config.port, None, opts.ipv4_only),
+                    };
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: dht_config.bootstrap_addrs,
                         cancellation_token: Some(token.child_token()),
@@ -774,9 +790,10 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            let udp_tracker_client =
+                UdpTrackerClient::new(token.clone(), bind_device.as_ref(), opts.udp_bind_ip)
+                    .await
+                    .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {
@@ -807,6 +824,10 @@ impl Session {
                 cancellation_token: token,
                 announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                utp_addr: listen_result
+                    .as_ref()
+                    .and_then(|l| l.utp_socket.as_ref())
+                    .map(|s| s.bind_addr()),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 connector: stream_connector,
@@ -1661,6 +1682,17 @@ impl Session {
         handle.update_only_files(only_files)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
+    }
+
+    /// Where the DHT, UDP tracker and uTP sockets are bound.
+    pub fn udp_local_addrs(&self) -> Vec<SocketAddr> {
+        self.dht
+            .as_ref()
+            .map(|d| d.listen_addr())
+            .into_iter()
+            .chain(std::iter::once(self.udp_tracker_client.local_addr()))
+            .chain(self.utp_addr)
+            .collect()
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {

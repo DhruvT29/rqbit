@@ -265,11 +265,14 @@ impl Drop for TransactionIdGuard<'_> {
 }
 
 impl UdpTrackerClient {
+    /// `bind_ip`, when given, is the one local address the client's socket
+    /// uses (and so the network interface its packets leave by).
     pub async fn new(
         cancel_token: CancellationToken,
         bind_device: Option<&BindDevice>,
+        bind_ip: Option<IpAddr>,
     ) -> anyhow::Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let addr = SocketAddr::new(bind_ip.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), 0);
         let sock = UdpSocket::bind_udp(
             addr,
             librqbit_dualstack_sockets::BindOpts {
@@ -292,6 +295,11 @@ impl UdpTrackerClient {
         });
 
         Ok(client)
+    }
+
+    /// The address the client's socket is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.state.sock.bind_addr()
     }
 
     async fn run(self) -> anyhow::Result<()> {
