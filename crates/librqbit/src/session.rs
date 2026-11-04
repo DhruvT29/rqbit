@@ -890,7 +890,11 @@ impl Session {
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                        Self::task_upnp_port_forwarder(
+                            announce_port,
+                            bind_device,
+                            opts.udp_bind_ip,
+                        ),
                     );
                 }
             }
@@ -1069,8 +1073,17 @@ impl Session {
     async fn task_upnp_port_forwarder(
         port: u16,
         bind_device: Option<BindDevice>,
+        udp_bind_ip: Option<std::net::IpAddr>,
     ) -> anyhow::Result<()> {
-        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
+        let bind_ip = match udp_bind_ip {
+            Some(std::net::IpAddr::V4(ip)) => Some(ip),
+            _ => None,
+        };
+        let options = librqbit_upnp::UpnpPortForwarderOptions {
+            bind_ip,
+            ..Default::default()
+        };
+        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], Some(options), bind_device)?;
         pf.run_forever().await
     }
 

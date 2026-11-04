@@ -315,20 +315,36 @@ pub fn parse_upnp_discover_response(
     })
 }
 
-pub async fn discover_once(
-    tx: &UnboundedSender<UpnpDiscoverResponse>,
-    kind: &str,
-    timeout: Duration,
+/// The socket SSDP goes through: on `bind_ip`, with multicast leaving from it,
+/// or wherever the OS chooses without one.
+fn ssdp_socket(
+    bind_ip: Option<Ipv4Addr>,
     bind_device: Option<&BindDevice>,
-) -> anyhow::Result<()> {
-    // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
+) -> anyhow::Result<UdpSocket> {
     let socket = UdpSocket::bind_udp(
-        (Ipv4Addr::UNSPECIFIED, 0).into(),
+        (bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), 0).into(),
         librqbit_dualstack_sockets::BindOpts {
             device: bind_device,
             ..Default::default()
         },
     )?;
+    if let Some(ip) = bind_ip {
+        socket2::SockRef::from(socket.socket())
+            .set_multicast_if_v4(&ip)
+            .context("error choosing the multicast interface")?;
+    }
+    Ok(socket)
+}
+
+pub async fn discover_once(
+    tx: &UnboundedSender<UpnpDiscoverResponse>,
+    kind: &str,
+    timeout: Duration,
+    bind_ip: Option<Ipv4Addr>,
+    bind_device: Option<&BindDevice>,
+) -> anyhow::Result<()> {
+    // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
+    let socket = ssdp_socket(bind_ip, bind_device)?;
 
     let message = make_ssdp_search_request(kind);
     socket
@@ -370,6 +386,8 @@ pub struct UpnpPortForwarderOptions {
     pub lease_duration: Duration,
     pub discover_interval: Duration,
     pub discover_timeout: Duration,
+    /// Look for routers through this address alone.
+    pub bind_ip: Option<Ipv4Addr>,
 }
 
 impl Default for UpnpPortForwarderOptions {
@@ -378,6 +396,7 @@ impl Default for UpnpPortForwarderOptions {
             discover_interval: Duration::from_secs(60),
             discover_timeout: Duration::from_secs(10),
             lease_duration: Duration::from_secs(60),
+            bind_ip: None,
         }
     }
 }
@@ -426,6 +445,7 @@ impl UpnpPortForwarder {
             tx,
             SSDP_SEARCH_WAN_IPCONNECTION_ST,
             self.opts.discover_timeout,
+            self.opts.bind_ip,
             self.bind_device.as_ref(),
         )
         .await
@@ -526,7 +546,18 @@ impl UpnpPortForwarder {
 mod tests {
     use quick_xml::de::from_str;
 
-    use crate::{Device, DeviceList, RootDesc, Service, ServiceList};
+    use std::net::Ipv4Addr;
+
+    use crate::{Device, DeviceList, RootDesc, Service, ServiceList, ssdp_socket};
+
+    #[tokio::test]
+    async fn ssdp_stays_on_the_address_it_is_given() {
+        let ip = Ipv4Addr::LOCALHOST;
+        let socket = ssdp_socket(Some(ip), None).unwrap();
+        assert_eq!(socket.bind_addr().ip(), ip);
+        let unbound = ssdp_socket(None, None).unwrap();
+        assert!(unbound.bind_addr().ip().is_unspecified());
+    }
 
     #[test]
     fn test_parse_root_desc() {
