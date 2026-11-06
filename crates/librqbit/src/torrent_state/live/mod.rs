@@ -134,6 +134,8 @@ pub(crate) struct TorrentStateLocked {
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
     unflushed_bitv_bytes: u64,
+    /// When the bitfield last went to disk.
+    bitv_flushed_at: std::time::Instant,
 }
 
 impl TorrentStateLocked {
@@ -166,11 +168,15 @@ impl TorrentStateLocked {
         } else {
             trace!("flushed bitfield");
             self.unflushed_bitv_bytes = 0;
+            self.bitv_flushed_at = std::time::Instant::now();
         }
     }
 }
 
 const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
+/// However slowly pieces come: 16 MiB can take minutes on a slow link, and all
+/// of it is fetched again if the process is killed before it is flushed.
+const FLUSH_BITV_EVERY: Duration = Duration::from_secs(2);
 
 pub enum AddIncomingPeerResult {
     Added,
@@ -279,6 +285,7 @@ impl TorrentStateLive {
                 file_priorities,
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
+                bitv_flushed_at: std::time::Instant::now(),
             }),
             files: paused.files,
             stats: AtomicStats {
@@ -780,6 +787,9 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // A paused torrent may be stopped for good, and nothing else flushes it.
+        g.try_flush_bitv(&self.shared, false);
+
         let piece_tracker = g
             .pieces
             .take()
@@ -871,7 +881,9 @@ impl TorrentStateLive {
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
 
         locked.unflushed_bitv_bytes += self.metadata.lengths().piece_length(id) as u64;
-        if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES {
+        if locked.unflushed_bitv_bytes >= FLUSH_BITV_EVERY_BYTES
+            || locked.bitv_flushed_at.elapsed() >= FLUSH_BITV_EVERY
+        {
             locked.try_flush_bitv(&self.shared, true)
         }
 
