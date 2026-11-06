@@ -154,7 +154,7 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
-                    if fo.check_piece(piece_id).is_err() {
+                    if !matches!(fo.check_piece(piece_id), Ok(true)) {
                         return true;
                     }
 
