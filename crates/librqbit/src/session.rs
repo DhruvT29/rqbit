@@ -15,7 +15,7 @@ use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
     api::TorrentIdOrHash,
     api_error::WithStatus,
-    bitv_factory::{BitVFactory, NonPersistentBitVFactory},
+    bitv_factory::{BitVFactory, FolderBitVFactory, NonPersistentBitVFactory},
     create_torrent,
     create_torrent_file::CreateTorrentResult,
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
@@ -439,6 +439,11 @@ pub struct SessionOptions {
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
 
+    /// Keep each torrent's bitfield in this folder, for fastresume alone: with
+    /// `persistence: None` the session restores no torrent by itself, and
+    /// whoever adds one again skips most of its check.
+    pub fastresume_folder: Option<PathBuf>,
+
     /// Turn on to dump session contents into a file periodically, so that on next start
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
@@ -502,6 +507,7 @@ impl Default for SessionOptions {
             bind_device_name: None,
             disable_trackers: false,
             fastresume: false,
+            fastresume_folder: None,
             persistence: None,
             peer_id: None,
             listen: None,
@@ -703,7 +709,13 @@ impl Session {
                         let p = Arc::new(PostgresSessionStorage::new(connection_string).await?);
                         make_result!(p)
                     }
-                    None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    None => match &opts.fastresume_folder {
+                        Some(folder) => Ok((
+                            None,
+                            Arc::new(FolderBitVFactory::new(folder.clone(), spawner).await?),
+                        )),
+                        None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    },
                 }
             }
 
